@@ -1,0 +1,25 @@
+name: Phantom Device
+category: Pwn
+difficulty: Hard
+points: 500
+flag_format: CSCTF{...}
+author: bohmiiiidd
+description: >
+  A captured drone from the Vostari military contains an intact mobile
+  communication module. Intelligence analysts use standard extraction tools
+  to pull data — but the device is not what it seems. Something on the wire
+  is lying.
+tags:
+  - heap
+  - glibc
+  - libimobiledevice
+  - FSOP
+files:
+  - files/client
+  - files/libc.so.6
+  - files/ld-linux-x86-64.so.2
+  - files/libimobiledevice-1.0.so.6
+  - files/libplist-2.0.so.4
+  - files/Dockerfile
+  - files/handler.sh
+  - files/entrypoint.sh

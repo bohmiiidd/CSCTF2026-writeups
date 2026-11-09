@@ -1,0 +1,12 @@
+version: "3.8"
+services:
+  helioform:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - FLAG=CSCTF{hsp_raw_d0wngrade_pr0xy_dial_env_t4p_runb00k}
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    dns: []

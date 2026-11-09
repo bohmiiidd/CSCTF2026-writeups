@@ -1,0 +1,18 @@
+name: Helioform Relay
+category: Web
+difficulty: Hard
+points: 500
+flag_format: CSCTF{...}
+author: bohmiiiidd
+description: >
+  A site relay appliance sits at the edge of the Kovari National Grid. The
+  operator console is locked, but the mesh protocol documentation is public.
+  Somewhere between the legacy agent wire and the compliance ledger, there
+  is a path the provisioner never closed.
+tags:
+  - websocket
+  - ssrf
+  - hmac
+  - path-traversal
+  - protocol
+files: []

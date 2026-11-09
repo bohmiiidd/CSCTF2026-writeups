@@ -1,0 +1,15 @@
+version: "3.8"
+
+services:
+  phantom-device:
+    build: .
+    ports:
+      - "1337:1337"
+    environment:
+      - FLAG=CSCTF{test_flag_phantom_device_2026}
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    dns: []
+    # No egress required: the client reads AFC directly from the inbound socket.
+    # For production CTF deployment, apply network policy to block all outbound.
