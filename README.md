@@ -5,7 +5,7 @@ Challenge author writeups and source for **[CSCTF 2026](https://2026.chronos-sec
 <img width="1617" height="918" alt="image" src="https://github.com/user-attachments/assets/939f61b6-7e8e-4787-9e77-629b29651058" />
 
 
-**Author:** [bohmiiidd](https://github.com/bohmiiidd)
+**Author:** [bohmiiidd](https://bohmiiiidd.kyubisec.com/)
 
 ---
 
