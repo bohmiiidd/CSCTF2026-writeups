@@ -1,6 +1,6 @@
 # Solution — Phantom Device
 
-**Category:** Pwn | **Difficulty:** Hard | **Points:** 500
+**Category:** Pwn | **Difficulty:** Hard | **Points:** 900
 
 ---
 
