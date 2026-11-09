@@ -1,8 +1,7 @@
 /*
  * client.c — Normal AFC client (victim process)
  *
- * Links REAL libimobiledevice.so. Has ZERO heap grooming, ZERO address
- * exchange, ZERO signal manipulation. Only standard AFC API calls.
+ * Links REAL libimobiledevice.so. Has only standard AFC API calls.
  *
  * Connection setup uses private struct definitions — test harness only.
  * A real attack targets a program that connects via idevice_new() + lockdown.
@@ -106,12 +105,11 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&afc->mutex, NULL);
     afc_client_t client = (afc_client_t)afc;
 
-    /* ══════════════════════════════════════════════════════════════════
+    /*
        NORMAL CLIENT CODE — a typical program browsing an iOS device.
        Only uses standard AFC API: read_directory, get_device_info,
        get_file_info, file_open, file_read, file_close.
-       ZERO heap grooming.  ZERO address exchange.  ZERO signal tricks.
-       ══════════════════════════════════════════════════════════════════ */
+    */
 
     char **dir1 = NULL, **dir2 = NULL, **dir3 = NULL;
     char **devi = NULL, **info = NULL;
